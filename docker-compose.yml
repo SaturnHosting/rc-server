@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  server:
+    image: python:3.9-slim
+    container_name: rc-server
+    restart: unless-stopped
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: >
+      bash -c "
+        apt-get update &&
+        apt-get install -y curl &&
+        curl -fsSL https://deb.nodesource.com/setup_18.x | bash - &&
+        apt-get install -y nodejs &&
+        pip install --no-cache-dir -r requirements.txt &&
+        python bot.py
+      "
+    environment:
+      - PYTHONUNBUFFERED=1
