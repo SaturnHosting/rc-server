@@ -13,6 +13,21 @@ TOKEN = config["token"]
 client_connections = {} 
 clients_lock = Lock()
 
+def broadcast_message(message, exclude_conn=None):
+    dead_clients = set()
+    with clients_lock:
+        for client in client_connections.keys():
+            if client == exclude_conn:
+                continue
+            try:
+                client.sendall(message.encode("utf-8"))
+            except:
+                dead_clients.add(client)
+        
+        for client in dead_clients:
+            if client in client_connections:
+                del client_connections[client]
+
 def handle_client(conn, addr):
     print(f"Attempt from {addr}")
     username = None
@@ -54,6 +69,8 @@ def handle_client(conn, addr):
         with clients_lock:
             client_connections[conn] = username
         
+        broadcast_message(f"CONNECTION {username} joined\n", exclude_conn=conn)
+        
         while True:
             data = conn.recv(4096)
             if not data:
@@ -67,7 +84,6 @@ def handle_client(conn, addr):
                 with clients_lock:
                     online_players = list(client_connections.values())
                 response = f"ONLINE {','.join(online_players)}\n"
-                print(f"[Sending: {response.strip()}")
                 conn.sendall(response.encode("utf-8"))
                 continue
             
@@ -79,7 +95,7 @@ def handle_client(conn, addr):
             with clients_lock:
                 for client in client_connections.keys():
                     try:
-                        client.sendall(data)
+                        client.sendall(data + b"\n")  
                     except:
                         dead_clients.add(client)
                 
@@ -91,6 +107,9 @@ def handle_client(conn, addr):
         print(f"Error with {addr} ({username}): {e}")
     
     finally:
+        if username:
+            broadcast_message(f"CONNECTION {username} left\n", exclude_conn=None)
+            
         with clients_lock:
             if conn in client_connections:
                 del client_connections[conn]
