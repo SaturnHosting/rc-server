@@ -7,6 +7,8 @@ services:
     restart: unless-stopped
     volumes:
       - .:/app
+    ports:
+      - "9999:3000"
     working_dir: /app
     command: >
       bash -c "
