@@ -1,7 +1,10 @@
 import socket
 import json
 import threading
-from threading import Lock
+import time
+import random
+from threading import Lock, Timer
+from collections import defaultdict
 
 with open("config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
@@ -12,6 +15,32 @@ TOKEN = config["token"]
 
 client_connections = {} 
 clients_lock = Lock()
+client_keepalive_timers = {}  
+client_pending_responses = defaultdict(dict) 
+KEEPALIVE_INTERVAL = 5 
+KEEPALIVE_TIMEOUT = 5   
+
+def disconnect_client(conn, reason="No keepalive response"):
+    username = None
+    with clients_lock:
+        if conn in client_connections:
+            username = client_connections[conn]
+            del client_connections[conn]
+        
+        if conn in client_keepalive_timers:
+            client_keepalive_timers[conn].cancel()
+            del client_keepalive_timers[conn]
+        
+        if conn in client_pending_responses:
+            del client_pending_responses[conn]
+    
+    try:
+        conn.close()
+        print(f"Disconnected {username}: {reason}")
+        if username:
+            broadcast_message(f"CONNECTION {username} left\n", exclude_conn=None)
+    except:
+        pass
 
 def broadcast_message(message, exclude_conn=None):
     dead_clients = set()
@@ -25,8 +54,65 @@ def broadcast_message(message, exclude_conn=None):
                 dead_clients.add(client)
         
         for client in dead_clients:
-            if client in client_connections:
-                del client_connections[client]
+            disconnect_client(client, "Broadcast failure")
+
+def send_keepalive(conn):
+    if conn.fileno() == -1: 
+        disconnect_client(conn, "Socket closed")
+        return
+    
+    challenge = random.randint(1000, 9999)
+    
+    with clients_lock:
+        if conn not in client_pending_responses:
+            client_pending_responses[conn] = {}
+        client_pending_responses[conn][challenge] = time.time()
+    
+    try:
+        message = f"KEEPALIVE {challenge}\n"
+        conn.sendall(message.encode("utf-8"))
+        #print(f"Sent keepalive challenge {challenge} to {client_connections.get(conn, 'unknown')}")
+    except:
+        disconnect_client(conn, "Keepalive send failed")
+        return
+    
+    threading.Timer(KEEPALIVE_TIMEOUT, check_keepalive_response, args=[conn, challenge]).start()
+    
+    if conn in client_connections:
+        client_keepalive_timers[conn] = threading.Timer(
+            KEEPALIVE_INTERVAL, 
+            send_keepalive, 
+            args=[conn]
+        )
+        client_keepalive_timers[conn].daemon = True
+        client_keepalive_timers[conn].start()
+
+def check_keepalive_response(conn, expected_challenge):
+    with clients_lock:
+        if conn not in client_pending_responses:
+            return  
+        
+        if expected_challenge in client_pending_responses[conn]:
+            disconnect_client(conn, f"No response to keepalive challenge {expected_challenge}")
+
+def handle_keepalive_response(conn, challenge_str):
+    try:
+        challenge = int(challenge_str)
+    except ValueError:
+        print(f"Invalid keepalive response from {client_connections.get(conn, 'unknown')}")
+        return False
+    
+    with clients_lock:
+        if conn not in client_pending_responses:
+            return False
+        
+        if challenge in client_pending_responses[conn]:
+            del client_pending_responses[conn][challenge]
+            #print(f"Received keepalive response {challenge} from {client_connections.get(conn, 'unknown')}")
+            return True
+        else:
+            print(f"Unexpected keepalive challenge {challenge} from {client_connections.get(conn, 'unknown')}")
+            return False
 
 def handle_client(conn, addr):
     print(f"Attempt from {addr}")
@@ -69,6 +155,8 @@ def handle_client(conn, addr):
         with clients_lock:
             client_connections[conn] = username
         
+        threading.Timer(KEEPALIVE_INTERVAL, send_keepalive, args=[conn]).start()
+        
         broadcast_message(f"CONNECTION {username} joined\n", exclude_conn=conn)
         
         while True:
@@ -77,7 +165,6 @@ def handle_client(conn, addr):
                 break
             
             data_str = data.decode("utf-8").strip()
-            print(f"Received from {username}: {data_str}")
             
             if data_str == "ONLINE":
                 print(f"Processing ONLINE request from {username}")
@@ -85,6 +172,12 @@ def handle_client(conn, addr):
                     online_players = list(client_connections.values())
                 response = f"ONLINE {','.join(online_players)}\n"
                 conn.sendall(response.encode("utf-8"))
+                continue
+            
+            if data_str.startswith("KEEPALIVE_RESPONSE "):
+                parts = data_str.split()
+                if len(parts) == 2:
+                    handle_keepalive_response(conn, parts[1])
                 continue
             
             if not data_str.startswith("MESSAGE "):
@@ -100,26 +193,19 @@ def handle_client(conn, addr):
                         dead_clients.add(client)
                 
                 for client in dead_clients:
-                    if client in client_connections:
-                        del client_connections[client]
+                    disconnect_client(client, "Message send failed")
     
     except Exception as e:
         print(f"Error with {addr} ({username}): {e}")
     
     finally:
-        if username:
-            broadcast_message(f"CONNECTION {username} left\n", exclude_conn=None)
-            
-        with clients_lock:
-            if conn in client_connections:
-                del client_connections[conn]
-        conn.close()
-        print(f"{addr} ({username}) disconnected")
+        disconnect_client(conn, "Client disconnected")
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))
     s.listen()
-    print("Server listening...")
+    print(f"Server listening on {HOST}:{PORT}...")
     
     while True:
         conn, addr = s.accept()
