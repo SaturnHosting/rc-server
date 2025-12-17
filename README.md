@@ -12,5 +12,6 @@ The backend socket-server for [Saturn RC](https://github.com/SaturnHosting/rc).
 ## Features
 - Messaging
 - Connection messages
-- Online player listing.
+- Online player listing
 - Authentication
+- Keepalive
