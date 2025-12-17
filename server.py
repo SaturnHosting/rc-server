@@ -17,8 +17,8 @@ client_connections = {}
 clients_lock = Lock()
 client_keepalive_timers = {}  
 client_pending_responses = defaultdict(dict) 
-KEEPALIVE_INTERVAL = 5 
-KEEPALIVE_TIMEOUT = 5   
+KEEPALIVE_INTERVAL = 10
+KEEPALIVE_TIMEOUT = 10 
 
 def disconnect_client(conn, reason="No keepalive response"):
     username = None
@@ -28,7 +28,10 @@ def disconnect_client(conn, reason="No keepalive response"):
             del client_connections[conn]
         
         if conn in client_keepalive_timers:
-            client_keepalive_timers[conn].cancel()
+            try:
+                client_keepalive_timers[conn].cancel()
+            except:
+                pass
             del client_keepalive_timers[conn]
         
         if conn in client_pending_responses:
@@ -36,25 +39,61 @@ def disconnect_client(conn, reason="No keepalive response"):
     
     try:
         conn.close()
-        print(f"Disconnected {username}: {reason}")
-        if username:
-            broadcast_message(f"CONNECTION {username} left\n", exclude_conn=None)
     except:
         pass
+    
+    print(f"Disconnected {username}: {reason}")
+    
+    if username:
+        send_to_all_except(f"CONNECTION {username} left\n", exclude_conn=conn)
+
+def send_to_all_except(message, exclude_conn=None):
+    dead_clients = []
+    with clients_lock:
+        clients_to_notify = list(client_connections.keys())
+    
+    for client in clients_to_notify:
+        if client == exclude_conn:
+            continue
+        try:
+            client.sendall(message.encode("utf-8"))
+        except:
+            dead_clients.append(client)
+    
+    for client in dead_clients:
+        with clients_lock:
+            if client in client_connections:
+                username = client_connections[client]
+                del client_connections[client]
+                if client in client_keepalive_timers:
+                    try:
+                        client_keepalive_timers[client].cancel()
+                    except:
+                        pass
+                    del client_keepalive_timers[client]
+                if client in client_pending_responses:
+                    del client_pending_responses[client]
+                try:
+                    client.close()
+                except:
+                    pass
+                print(f"Cleaned up dead client {username} during broadcast")
 
 def broadcast_message(message, exclude_conn=None):
-    dead_clients = set()
+    dead_clients = []
     with clients_lock:
-        for client in client_connections.keys():
-            if client == exclude_conn:
-                continue
-            try:
-                client.sendall(message.encode("utf-8"))
-            except:
-                dead_clients.add(client)
-        
-        for client in dead_clients:
-            disconnect_client(client, "Broadcast failure")
+        clients_to_notify = list(client_connections.keys())
+    
+    for client in clients_to_notify:
+        if client == exclude_conn:
+            continue
+        try:
+            client.sendall(message.encode("utf-8"))
+        except:
+            dead_clients.append(client)
+    
+    for client in dead_clients:
+        disconnect_client(client, "Failed during broadcast")
 
 def send_keepalive(conn):
     if conn.fileno() == -1: 
@@ -71,26 +110,26 @@ def send_keepalive(conn):
     try:
         message = f"KEEPALIVE {challenge}\n"
         conn.sendall(message.encode("utf-8"))
-        #print(f"Sent keepalive challenge {challenge} to {client_connections.get(conn, 'unknown')}")
     except:
         disconnect_client(conn, "Keepalive send failed")
         return
     
     threading.Timer(KEEPALIVE_TIMEOUT, check_keepalive_response, args=[conn, challenge]).start()
     
-    if conn in client_connections:
-        client_keepalive_timers[conn] = threading.Timer(
-            KEEPALIVE_INTERVAL, 
-            send_keepalive, 
-            args=[conn]
-        )
-        client_keepalive_timers[conn].daemon = True
-        client_keepalive_timers[conn].start()
+    with clients_lock:
+        if conn in client_connections:
+            client_keepalive_timers[conn] = threading.Timer(
+                KEEPALIVE_INTERVAL, 
+                send_keepalive, 
+                args=[conn]
+            )
+            client_keepalive_timers[conn].daemon = True
+            client_keepalive_timers[conn].start()
 
 def check_keepalive_response(conn, expected_challenge):
     with clients_lock:
         if conn not in client_pending_responses:
-            return  
+            return
         
         if expected_challenge in client_pending_responses[conn]:
             disconnect_client(conn, f"No response to keepalive challenge {expected_challenge}")
@@ -108,7 +147,6 @@ def handle_keepalive_response(conn, challenge_str):
         
         if challenge in client_pending_responses[conn]:
             del client_pending_responses[conn][challenge]
-            #print(f"Received keepalive response {challenge} from {client_connections.get(conn, 'unknown')}")
             return True
         else:
             print(f"Unexpected keepalive challenge {challenge} from {client_connections.get(conn, 'unknown')}")
@@ -119,7 +157,9 @@ def handle_client(conn, addr):
     username = None
     
     try:
+        conn.settimeout(10)
         auth_data = conn.recv(1024).decode("utf-8").strip()
+        conn.settimeout(None)
 
         if not auth_data.startswith("AUTH "):
             print(f"Invalid auth format from {addr}")
